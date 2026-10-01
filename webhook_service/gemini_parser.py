@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.area_codes import SUPPORTED_CITY_NAMES  # noqa: E402
@@ -35,7 +35,8 @@ def _get_client():
     """
     global _client
     if _client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
+        # google-genai 官方文件也接受 GOOGLE_API_KEY，兩個名稱都認，避免設錯名稱就整個無法使用
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise RuntimeError("環境變數 GEMINI_API_KEY 未設定，無法呼叫 Gemini")
         _client = genai.Client(api_key=api_key)
@@ -166,7 +167,12 @@ def parse(text: str) -> dict | None:
             )
             result = json.loads(response.text)
             break
-        except Exception as exc:  # noqa: BLE001 - 任何 Gemini/網路例外都視為暫時性失敗
+        except errors.ClientError as exc:
+            # 4xx（金鑰錯誤/無權限、model 不存在、schema 不合法、額度用完 429）重試幾秒內也不會好，
+            # 直接往外拋，不要讓使用者白等好幾輪重試
+            print(f"[錯誤] Gemini 拒絕請求（HTTP {exc.code}，不重試）：{exc}", file=sys.stderr)
+            raise
+        except Exception as exc:  # noqa: BLE001 - 其他 Gemini/網路例外都視為暫時性失敗
             if attempt < _MAX_RETRIES:
                 print(
                     f"[警告] Gemini 解析失敗（第 {attempt} 次，{_RETRY_DELAY_SECONDS} 秒後重試）：{exc}",
@@ -233,6 +239,94 @@ def parse(text: str) -> dict | None:
         "include_remote": include_remote,
         "notify_interval_hours": notify_interval,
         "max_jobs_per_run": max_jobs_per_run,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gemini 無法使用時（額度用完、金鑰失效、服務過載…）的備援解析
+# ---------------------------------------------------------------------------
+
+_FALLBACK_SALARY_PATTERN = re.compile(
+    r"(月薪|年薪)\s*(?:要|需|至少|最少|最低|起碼)?\s*(\d[\d,]*(?:\.\d+)?)\s*(萬|[kK千])?\s*元?\s*(?:以上|起跳|起)?"
+)
+_FALLBACK_CITY_PATTERNS = [
+    ("雙北", ["台北市", "新北市"]),
+    ("新北市", ["新北市"]),
+    ("新北", ["新北市"]),
+    ("台北市", ["台北市"]),
+    ("臺北市", ["台北市"]),
+    ("台北", ["台北市"]),
+    ("臺北", ["台北市"]),
+]
+# 這些字眼代表訊息牽涉到捷運範圍、遠端、通知頻率/筆數等較複雜的設定，規則式解析不可靠，交給 Gemini
+_FALLBACK_UNSUPPORTED_HINTS = ["捷運", "站", "遠端", "小時", "筆", "通知", "頻率", "步行", "分鐘"]
+_FALLBACK_FILLER_PREFIXES = [
+    "我要尋找", "我想尋找", "請幫我找", "請幫我", "幫我找", "我要找", "我想找", "想找", "要找",
+    "尋找", "幫我", "我要", "我想", "請", "找", "在", "的",
+]
+_FALLBACK_FILLER_SUFFIXES = ["的工作", "工作", "的職缺", "職缺", "的", "以上"]
+_FALLBACK_SEPARATORS = re.compile(r"[\s,，、。.!！?？;；:：/和及與或跟]+")
+
+
+def _strip_fillers(token: str) -> str:
+    changed = True
+    while changed and token:
+        changed = False
+        for prefix in _FALLBACK_FILLER_PREFIXES:
+            if token.startswith(prefix):
+                token, changed = token[len(prefix):], True
+        for suffix in _FALLBACK_FILLER_SUFFIXES:
+            if token.endswith(suffix):
+                token, changed = token[: -len(suffix)], True
+    return token
+
+
+def fallback_parse(text: str) -> dict | None:
+    """不靠 Gemini、用簡單規則解析「城市＋職稱＋薪資」這種最常見的訂閱訊息。
+
+    只處理有明確職稱關鍵字的訊息；牽涉捷運範圍、遠端、通知頻率等設定的訊息規則式解析
+    不可靠，回傳 None 讓呼叫端照舊回覆「系統忙碌」。
+    """
+    if any(hint in text for hint in _FALLBACK_UNSUPPORTED_HINTS):
+        return None
+
+    rest = text
+    min_annual_salary = None
+    salary_match = _FALLBACK_SALARY_PATTERN.search(rest)
+    if salary_match:
+        kind, number, unit = salary_match.groups()
+        amount = float(number.replace(",", ""))
+        if unit == "萬":
+            amount *= 10_000
+        elif unit:
+            amount *= 1_000
+        min_annual_salary = int(amount * 14) if kind == "月薪" else int(amount)
+        rest = rest[: salary_match.start()] + " " + rest[salary_match.end():]
+
+    areas: list[str] = []
+    for name, cities in _FALLBACK_CITY_PATTERNS:
+        if name in rest:
+            areas.extend(c for c in cities if c not in areas)
+            rest = rest.replace(name, " ")
+
+    keywords = []
+    for token in _FALLBACK_SEPARATORS.split(rest):
+        token = _strip_fillers(token.strip())
+        if 2 <= len(token) <= 20 and not re.search(r"\d", token) and token not in keywords:
+            keywords.append(token)
+    if not keywords:
+        return None
+
+    return {
+        "intent": "subscribe_or_update",
+        "keywords": keywords,
+        "areas": areas or None,
+        "min_annual_salary": min_annual_salary,
+        "mrt_stations": None,
+        "max_walk_km": None,
+        "include_remote": None,
+        "notify_interval_hours": None,
+        "max_jobs_per_run": None,
     }
 
 
