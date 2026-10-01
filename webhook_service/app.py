@@ -9,6 +9,7 @@ import hmac
 import base64
 import os
 import sys
+import traceback
 from pathlib import Path
 
 import requests
@@ -120,8 +121,14 @@ def _handle_text_message(user_id: str, reply_token: str, text: str) -> None:
     try:
         parsed = gemini_parser.parse(text)
     except Exception:  # noqa: BLE001 - Gemini 暫時忙碌/呼叫失敗，跟「看不懂」是不同情況
-        _reply(reply_token, ERROR_MESSAGE)
-        return
+        traceback.print_exc()
+        # Gemini 掛掉（額度用完、金鑰失效、過載…）時，「城市＋職稱＋薪資」這種常見訊息
+        # 改用規則式解析，不要讓使用者只能一直收到「系統忙碌」
+        parsed = gemini_parser.fallback_parse(text)
+        if parsed is None:
+            _reply(reply_token, ERROR_MESSAGE)
+            return
+        print(f"[警告] Gemini 無法使用，改用規則式解析：{parsed}", file=sys.stderr)
     if parsed is None:
         _reply(reply_token, UNCLEAR_MESSAGE)
         return
@@ -228,6 +235,7 @@ def webhook():
                 )
         except Exception as exc:  # noqa: BLE001 - 單一事件出錯不能影響其他事件，也不能讓 LINE 重試風暴
             print(f"[錯誤] 處理事件失敗：{exc}", file=sys.stderr)
+            traceback.print_exc()
             reply_token = event.get("replyToken")
             if reply_token:
                 _reply(reply_token, ERROR_MESSAGE)
