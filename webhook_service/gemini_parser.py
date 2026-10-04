@@ -258,14 +258,49 @@ _FALLBACK_CITY_PATTERNS = [
     ("台北", ["台北市"]),
     ("臺北", ["台北市"]),
 ]
-# 這些字眼代表訊息牽涉到捷運範圍、遠端、通知頻率/筆數等較複雜的設定，規則式解析不可靠，交給 Gemini
-_FALLBACK_UNSUPPORTED_HINTS = ["捷運", "站", "遠端", "小時", "筆", "通知", "頻率", "步行", "分鐘"]
+# 「頂埔到忠孝新生」這種兩個站名用「到/至」連起來的寫法，就算沒寫「捷運」「站」也一定是捷運範圍
+_STATION_ALTERNATION = "|".join(re.escape(s) for s in sorted(ALL_STATIONS, key=len, reverse=True))
+_FALLBACK_STATION_RANGE_PATTERN = re.compile(
+    rf"({_STATION_ALTERNATION})站?\s*(?:到|至|~|～|-)\s*(?:捷運)?({_STATION_ALTERNATION})"
+)
+_FALLBACK_NUMBER = r"(\d+|[一二兩三四五六七八九十]+)"
+_FALLBACK_INTERVAL_PATTERN = re.compile(r"每\s*" + _FALLBACK_NUMBER + r"\s*個?\s*小時")
+_FALLBACK_COUNT_PATTERN = re.compile(_FALLBACK_NUMBER + r"\s*筆")
+_FALLBACK_WALK_PATTERN = re.compile(r"步行\s*" + _FALLBACK_NUMBER + r"\s*分鐘")
+# 「不要遠端」「不用全遠端」才算排除遠端；「不要部分遠端」只是排除部分遠端，全遠端照樣要
+_FALLBACK_NO_REMOTE_PATTERN = re.compile(r"(?:不要|不用|不需要|排除)\s*(?:找)?\s*(?:全|完全)?遠端")
+_FALLBACK_WANT_REMOTE_PATTERN = re.compile(r"全遠端|完全遠端|含遠端|可遠端|可以遠端|也要遠端|遠端也")
+# 含這些字的片段是在描述設定（捷運範圍、遠端、頻率…），不是職稱，不能當成關鍵字
+_FALLBACK_SETTING_HINTS = [
+    "捷運", "站", "遠端", "小時", "筆", "通知", "頻率", "步行", "分鐘", "之間", "附近",
+    "地區", "薪", "改成", "設定", "取消",
+]
+# 有職稱關鍵字的訊息會整筆覆蓋訂閱條件，所以只接受看起來像職稱的字詞，避免「你好」被當成職稱
+_FALLBACK_JOB_TITLE_PATTERN = re.compile(
+    r"工程師|設計師|分析師|架構師|管理師|程式|開發|前端|後端|全端|經理|專員|助理|主管|顧問|"
+    r"技術員|技師|研發|測試|維運|資料|數據|會計|業務|客服|行政|秘書|人資|企劃|行銷|編輯|設計|"
+    r"講師|老師|護理|藥師|司機|店長|廚師|營運|"
+    r"engineer|developer|designer|analyst|manager|architect|devops|sre|\bqa\b|\bpm\b",
+    re.IGNORECASE,
+)
+_FALLBACK_STOPWORDS = {"公司", "工作", "職缺", "只要", "不要", "可以", "也要", "就好", "條件", "謝謝"}
 _FALLBACK_FILLER_PREFIXES = [
     "我要尋找", "我想尋找", "請幫我找", "請幫我", "幫我找", "我要找", "我想找", "想找", "要找",
     "尋找", "幫我", "我要", "我想", "請", "找", "在", "的",
 ]
 _FALLBACK_FILLER_SUFFIXES = ["的工作", "工作", "的職缺", "職缺", "的", "以上"]
 _FALLBACK_SEPARATORS = re.compile(r"[\s,，、。.!！?？;；:：/和及與或跟]+")
+_CHINESE_DIGITS = {"一": 1, "二": 2, "兩": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _to_int(number: str) -> int:
+    """把「12」「三」「十五」「二十」這類數字轉成整數。"""
+    if number.isdigit():
+        return int(number)
+    if "十" in number:
+        tens, _, ones = number.partition("十")
+        return _CHINESE_DIGITS.get(tens, 1) * 10 + _CHINESE_DIGITS.get(ones, 0)
+    return _CHINESE_DIGITS.get(number, 0)
 
 
 def _strip_fillers(token: str) -> str:
@@ -282,14 +317,11 @@ def _strip_fillers(token: str) -> str:
 
 
 def fallback_parse(text: str) -> dict | None:
-    """不靠 Gemini、用簡單規則解析「城市＋職稱＋薪資」這種最常見的訂閱訊息。
+    """不靠 Gemini、用簡單規則解析訂閱訊息：城市、職稱、薪資、捷運範圍、步行時間、
+    是否含全遠端、通知頻率、每次筆數。Gemini 額度用完或掛掉時使用。
 
-    只處理有明確職稱關鍵字的訊息；牽涉捷運範圍、遠端、通知頻率等設定的訊息規則式解析
-    不可靠，回傳 None 讓呼叫端照舊回覆「系統忙碌」。
+    什麼都解析不出來時回傳 None，讓呼叫端照舊回覆「系統忙碌」。
     """
-    if any(hint in text for hint in _FALLBACK_UNSUPPORTED_HINTS):
-        return None
-
     rest = text
     min_annual_salary = None
     salary_match = _FALLBACK_SALARY_PATTERN.search(rest)
@@ -303,18 +335,69 @@ def fallback_parse(text: str) -> dict | None:
         min_annual_salary = int(amount * 14) if kind == "月薪" else int(amount)
         rest = rest[: salary_match.start()] + " " + rest[salary_match.end():]
 
+    mrt_stations = None
+    range_match = _FALLBACK_STATION_RANGE_PATTERN.search(text)
+    mrt_range = range_match.groups() if range_match else _fallback_mrt_range(text)
+    if mrt_range:
+        mrt_stations = stations_between(*mrt_range)
+
+    walk_match = _FALLBACK_WALK_PATTERN.search(text)
+    max_walk_km = (
+        round(_to_int(walk_match.group(1)) * _WALK_KM_PER_MINUTE, 2) if walk_match else None
+    )
+
+    include_remote = None
+    if _FALLBACK_NO_REMOTE_PATTERN.search(text):
+        include_remote = False
+    elif _FALLBACK_WANT_REMOTE_PATTERN.search(text):
+        include_remote = True
+
+    notify_interval = None
+    interval_match = _FALLBACK_INTERVAL_PATTERN.search(text)
+    if interval_match:
+        notify_interval = _to_int(interval_match.group(1))
+    elif "每小時" in text or "每個小時" in text:
+        notify_interval = 1
+    elif "每天" in text or ("一天" in text and "一次" in text):
+        notify_interval = 24
+    if notify_interval is not None:
+        notify_interval = max(_MIN_NOTIFY_INTERVAL_HOURS, min(_MAX_NOTIFY_INTERVAL_HOURS, notify_interval))
+
+    max_jobs_per_run = None
+    count_match = _FALLBACK_COUNT_PATTERN.search(text)
+    if count_match:
+        max_jobs_per_run = max(
+            _MIN_MAX_JOBS_PER_RUN, min(_MAX_MAX_JOBS_PER_RUN, _to_int(count_match.group(1)))
+        )
+
     areas: list[str] = []
     for name, cities in _FALLBACK_CITY_PATTERNS:
         if name in rest:
             areas.extend(c for c in cities if c not in areas)
             rest = rest.replace(name, " ")
+    if mrt_stations:
+        areas = []  # 有精確捷運範圍時，地區改用這個判斷，跟 parse() 一致
 
     keywords = []
     for token in _FALLBACK_SEPARATORS.split(rest):
-        token = _strip_fillers(token.strip())
-        if 2 <= len(token) <= 20 and not re.search(r"\d", token) and token not in keywords:
+        # 「步行五分鐘內的後端工程師」「板橋的前端工程師」：職稱是最後一個「的」後面那段
+        token = token.strip().rsplit("的", 1)[-1]
+        if any(hint in token for hint in _FALLBACK_SETTING_HINTS):
+            continue
+        token = _strip_fillers(token)
+        if (
+            2 <= len(token) <= 20
+            and not re.search(r"\d", token)
+            and token not in _FALLBACK_STOPWORDS
+            and _FALLBACK_JOB_TITLE_PATTERN.search(token)
+            and token not in keywords
+        ):
             keywords.append(token)
-    if not keywords:
+
+    if not any([
+        keywords, areas, min_annual_salary, mrt_stations,
+        include_remote is not None, notify_interval, max_jobs_per_run,
+    ]):
         return None
 
     return {
@@ -322,11 +405,11 @@ def fallback_parse(text: str) -> dict | None:
         "keywords": keywords,
         "areas": areas or None,
         "min_annual_salary": min_annual_salary,
-        "mrt_stations": None,
-        "max_walk_km": None,
-        "include_remote": None,
-        "notify_interval_hours": None,
-        "max_jobs_per_run": None,
+        "mrt_stations": mrt_stations,
+        "max_walk_km": max_walk_km,
+        "include_remote": include_remote,
+        "notify_interval_hours": notify_interval,
+        "max_jobs_per_run": max_jobs_per_run,
     }
 
 
